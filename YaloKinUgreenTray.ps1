@@ -7,6 +7,8 @@ $vpnName = 'AmneziaVPN'
 $hotspotAddress = '192.168.137.1'
 $routePrefixes = @('192.168.137.0/25', '192.168.137.128/25')
 $netsh = "$env:SystemRoot\System32\netsh.exe"
+$powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$repairScript = Join-Path $PSScriptRoot 'Repair-YaloKinUgreen.ps1'
 $logDirectory = Join-Path $env:ProgramData 'YaloKinUgreen'
 $logPath = Join-Path $logDirectory 'hotspot.log'
 
@@ -16,27 +18,31 @@ function Get-StateLevel {
         [bool]$AddressReady,
         [bool]$DhcpReady,
         [bool]$RoutesReady,
+        [bool]$IcsReady,
         [bool]$VpnReady
     )
 
     if (-not $HotspotUp) { return 'Stopped' }
-    if (-not ($AddressReady -and $DhcpReady -and $RoutesReady)) { return 'Degraded' }
+    if (-not ($AddressReady -and $DhcpReady -and $RoutesReady -and $IcsReady)) {
+        return 'Degraded'
+    }
     if (-not $VpnReady) { return 'NoVpn' }
     return 'Ready'
 }
 
 if ($SelfTest) {
     $cases = @(
-        @($false, $false, $false, $false, $false, 'Stopped'),
-        @($true,  $false, $false, $false, $false, 'Degraded'),
-        @($true,  $true,  $true,  $true,  $false, 'NoVpn'),
-        @($true,  $true,  $true,  $true,  $true,  'Ready')
+        @($false, $false, $false, $false, $false, $false, 'Stopped'),
+        @($true,  $false, $false, $false, $false, $false, 'Degraded'),
+        @($true,  $true,  $true,  $true,  $true,  $false, 'NoVpn'),
+        @($true,  $true,  $true,  $true,  $true,  $true,  'Ready')
     )
 
     foreach ($case in $cases) {
-        $actual = Get-StateLevel $case[0] $case[1] $case[2] $case[3] $case[4]
-        if ($actual -ne $case[5]) {
-            throw "Self-test failed: expected $($case[5]), got $actual."
+        $actual = Get-StateLevel `
+            $case[0] $case[1] $case[2] $case[3] $case[4] $case[5]
+        if ($actual -ne $case[6]) {
+            throw "Self-test failed: expected $($case[6]), got $actual."
         }
     }
 
@@ -106,7 +112,14 @@ function Invoke-Netsh {
 }
 
 function Get-HotspotAdapter {
-    $adapters = @(Get-NetAdapter -Name $privateName -IncludeHidden -ErrorAction SilentlyContinue)
+    $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq $privateName -or
+            $_.InterfaceDescription -like '*Hosted Network Virtual Adapter*'
+        } |
+        Sort-Object `
+            @{ Expression = { $_.Status -eq 'Up' }; Descending = $true },
+            @{ Expression = { $_.Name -eq $privateName }; Descending = $true })
     if ($adapters.Count -eq 0) { return $null }
     return $adapters[0]
 }
@@ -122,6 +135,34 @@ function Test-VpnReady {
         -ErrorAction SilentlyContinue |
         Where-Object DestinationPrefix -In '0.0.0.0/0', '0.0.0.0/1', '128.0.0.0/1')
     return ($vpnRoutes.Count -gt 0)
+}
+
+function Test-IcsReady {
+    param($Adapter)
+
+    if ($null -eq $Adapter) { return $false }
+    try {
+        $publicReady = $false
+        $privateReady = $false
+        $manager = New-Object -ComObject HNetCfg.HNetShare
+        foreach ($connection in $manager.EnumEveryConnection()) {
+            $properties = $manager.NetConnectionProps($connection)
+            $configuration = $manager.INetSharingConfigurationForINetConnection($connection)
+            if (-not $configuration.SharingEnabled) { continue }
+            if ($configuration.SharingConnectionType -eq 0 -and
+                $properties.Name -eq $vpnName) {
+                $publicReady = $true
+            }
+            if ($configuration.SharingConnectionType -eq 1 -and
+                $properties.Name -eq $Adapter.Name) {
+                $privateReady = $true
+            }
+        }
+        return ($publicReady -and $privateReady)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Repair-HotspotRoutes {
@@ -144,7 +185,7 @@ function Repair-HotspotRoutes {
             -InterfaceIndex $adapter.InterfaceIndex `
             -AddressFamily IPv4 `
             -InterfaceMetric 1
-        Write-Log "Set interface metric 1 on $privateName."
+        Write-Log "Set interface metric 1 on $($adapter.Name)."
     }
 
     foreach ($prefix in $routePrefixes) {
@@ -162,7 +203,7 @@ function Repair-HotspotRoutes {
                 -NextHop '0.0.0.0' `
                 -RouteMetric 1 `
                 -ErrorAction Stop | Out-Null
-            Write-Log "Added route $prefix via $privateName."
+            Write-Log "Added route $prefix via $($adapter.Name)."
             continue
         }
 
@@ -175,80 +216,27 @@ function Repair-HotspotRoutes {
     }
 }
 
-function Ensure-HotspotAddress {
-    $adapter = Get-HotspotAdapter
-    if ($null -eq $adapter -or $adapter.Status -ne 'Up') {
-        throw "Adapter '$privateName' is not active."
-    }
-
-    $address = Get-NetIPAddress `
-        -InterfaceIndex $adapter.InterfaceIndex `
-        -AddressFamily IPv4 `
-        -IPAddress $hotspotAddress `
-        -ErrorAction SilentlyContinue
-    if ($null -ne $address) { return }
-
-    $result = Invoke-Netsh -Arguments @(
-        'interface', 'ipv4', 'set', 'address',
-        "name=$privateName", 'source=static', "address=$hotspotAddress",
-        'mask=255.255.255.0', 'gateway=none', 'store=persistent'
-    )
-    if ($result.ExitCode -ne 0) {
-        throw "Could not set $hotspotAddress on '$privateName'."
-    }
-
-    Start-Sleep -Seconds 2
-    Write-Log "Assigned $hotspotAddress/24 to $privateName."
-}
-
 function Start-Hotspot {
-    Start-Service WlanSvc -ErrorAction SilentlyContinue
-    Start-Service SharedAccess -ErrorAction SilentlyContinue
-
-    $ugreenAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
-        Where-Object InterfaceDescription -Like '*Ugreen*')
-    if ($ugreenAdapters.Count -eq 0) { throw 'Ugreen USB Wi-Fi adapter was not found.' }
-    if ($ugreenAdapters[0].Status -eq 'Disabled') {
-        $ugreenAdapters[0] | Enable-NetAdapter -Confirm:$false
-        Start-Sleep -Seconds 3
-        $ugreenAdapters = @(Get-NetAdapter `
-            -InterfaceIndex $ugreenAdapters[0].InterfaceIndex `
-            -IncludeHidden `
-            -ErrorAction SilentlyContinue)
+    if (-not (Test-Path -LiteralPath $repairScript)) {
+        throw "Repair script not found: $repairScript"
     }
-    if ($ugreenAdapters.Count -eq 0 -or $ugreenAdapters[0].Status -eq 'Not Present') {
-        throw 'Ugreen USB Wi-Fi adapter is not available.'
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$repairScript`" -Quiet"
+    $process = Start-Process `
+        -FilePath $powerShell `
+        -ArgumentList $arguments `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+    if ($process.ExitCode -ne 0) {
+        throw "Hotspot repair failed with exit code $($process.ExitCode). See repair.log."
     }
-    Write-Log "Ugreen adapter: $($ugreenAdapters[0].Name); status=$($ugreenAdapters[0].Status); ifIndex=$($ugreenAdapters[0].InterfaceIndex)."
-
-    $allow = Invoke-Netsh -Arguments @('wlan', 'set', 'hostednetwork', 'mode=allow')
-    if ($allow.ExitCode -ne 0) { throw 'Windows could not enable Hosted Network mode.' }
-
-    $start = Invoke-Netsh -Arguments @('wlan', 'start', 'hostednetwork')
-    if ($start.ExitCode -ne 0) {
-        Write-Log 'Hosted Network start failed; resetting the dedicated Ugreen adapter once.'
-        $ugreenAdapters[0] | Disable-NetAdapter -Confirm:$false -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        $ugreenAdapters[0] | Enable-NetAdapter -Confirm:$false -ErrorAction Stop
-        Start-Sleep -Seconds 8
-
-        $allow = Invoke-Netsh -Arguments @('wlan', 'set', 'hostednetwork', 'mode=allow')
-        if ($allow.ExitCode -ne 0) { throw 'Hosted Network mode failed after Ugreen reset.' }
-        $start = Invoke-Netsh -Arguments @('wlan', 'start', 'hostednetwork')
-        if ($start.ExitCode -ne 0) {
-            throw "Windows could not start Hosted Network after Ugreen reset (exit $($start.ExitCode))."
-        }
-    }
-
-    Start-Sleep -Seconds 3
-    Ensure-HotspotAddress
-    Repair-HotspotRoutes
-    Write-Log 'Hotspot start/repair completed.'
+    Write-Log 'Full hotspot, ICS, DHCP, and route repair completed.'
 }
 
 function Stop-Hotspot {
     $stop = Invoke-Netsh -Arguments @('wlan', 'stop', 'hostednetwork')
-    if ($stop.ExitCode -ne 0 -and (Get-HotspotAdapter).Status -eq 'Up') {
+    $adapter = Get-HotspotAdapter
+    if ($stop.ExitCode -ne 0 -and $null -ne $adapter -and $adapter.Status -eq 'Up') {
         throw "Windows could not stop Hosted Network (exit $($stop.ExitCode))."
     }
     Write-Log 'Hotspot stopped.'
@@ -267,6 +255,7 @@ function Get-HotspotStatus {
     $addressReady = $false
     $dhcpReady = $false
     $routesReady = $false
+    $icsReady = $false
 
     if ($hotspotUp) {
         $addressReady = $null -ne (Get-NetIPAddress `
@@ -297,15 +286,18 @@ function Get-HotspotStatus {
                 Where-Object { $_.NextHop -eq '0.0.0.0' -and $_.RouteMetric -eq 1 }
             if ($null -eq $route) { $routesReady = $false }
         }
+        $icsReady = Test-IcsReady $adapter
     }
 
     $vpnReady = Test-VpnReady
     [pscustomobject]@{
-        Level = Get-StateLevel $hotspotUp $addressReady $dhcpReady $routesReady $vpnReady
+        Level = Get-StateLevel `
+            $hotspotUp $addressReady $dhcpReady $routesReady $icsReady $vpnReady
         HotspotUp = $hotspotUp
         AddressReady = $addressReady
         DhcpReady = $dhcpReady
         RoutesReady = $routesReady
+        IcsReady = $icsReady
         VpnReady = $vpnReady
     }
 }
@@ -317,6 +309,7 @@ function Get-StatusText {
         "Hotspot: $($Status.HotspotUp)",
         "Address ${hotspotAddress}: $($Status.AddressReady)",
         "DHCP: $($Status.DhcpReady)",
+        "ICS binding: $($Status.IcsReady)",
         "Local /25 routes: $($Status.RoutesReady)",
         "AmneziaVPN route: $($Status.VpnReady)",
         "State: $($Status.Level)"
@@ -362,6 +355,37 @@ $script:notify.Icon = [Drawing.SystemIcons]::Application
 $script:notify.Text = 'YaloKin Ugreen: starting'
 $script:notify.Visible = $true
 $script:lastLevel = $null
+$script:backgroundRepair = $null
+$script:lastRepairAttempt = [datetime]::MinValue
+
+function Update-BackgroundRepair {
+    if ($null -eq $script:backgroundRepair -or
+        -not $script:backgroundRepair.HasExited) {
+        return
+    }
+
+    Write-Log "Automatic repair exited with code $($script:backgroundRepair.ExitCode)."
+    $script:backgroundRepair.Dispose()
+    $script:backgroundRepair = $null
+}
+
+function Start-BackgroundRepair {
+    Update-BackgroundRepair
+    if ($null -ne $script:backgroundRepair) { return }
+    if (-not (Test-Path -LiteralPath $repairScript)) {
+        Write-Log "Automatic repair script not found: $repairScript"
+        return
+    }
+
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$repairScript`" -Quiet"
+    $script:backgroundRepair = Start-Process `
+        -FilePath $powerShell `
+        -ArgumentList $arguments `
+        -WindowStyle Hidden `
+        -PassThru
+    $script:lastRepairAttempt = Get-Date
+    Write-Log 'Automatic full repair started in the background.'
+}
 
 function Update-TrayStatus {
     try {
@@ -455,8 +479,18 @@ $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 10000
 $script:timer.Add_Tick({
     try {
+        Update-BackgroundRepair
         $status = Get-HotspotStatus
-        if ($status.HotspotUp -and $status.AddressReady) {
+        $networkDegraded = $status.HotspotUp -and -not (
+            $status.AddressReady -and
+            $status.DhcpReady -and
+            $status.RoutesReady -and
+            $status.IcsReady
+        )
+        if ($networkDegraded -and
+            ((Get-Date) - $script:lastRepairAttempt).TotalSeconds -ge 60) {
+            Start-BackgroundRepair
+        } elseif ($status.HotspotUp -and $status.AddressReady) {
             Repair-HotspotRoutes
         }
     }

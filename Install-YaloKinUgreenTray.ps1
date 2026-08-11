@@ -14,16 +14,34 @@ $sourceScript = Join-Path $PSScriptRoot 'YaloKinUgreenTray.ps1'
 if (-not (Test-Path -LiteralPath $sourceScript)) {
     throw "Tray script not found: $sourceScript"
 }
+$sourceRepairScript = Join-Path $PSScriptRoot 'Repair-YaloKinUgreen.ps1'
+if (-not (Test-Path -LiteralPath $sourceRepairScript)) {
+    throw "Repair script not found: $sourceRepairScript"
+}
 
 $installDirectory = Join-Path $env:ProgramData 'YaloKinUgreen'
 $targetScript = Join-Path $installDirectory 'YaloKinUgreenTray.ps1'
+$targetRepairScript = Join-Path $installDirectory 'Repair-YaloKinUgreen.ps1'
 $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
 $shortcutPath = Join-Path $desktop 'YaloKin Ugreen Hotspot.lnk'
 $powerShellPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+
+$runningTray = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -in 'powershell.exe', 'pwsh.exe' -and
+        $_.CommandLine -like "*$targetScript*"
+    })
+foreach ($process in $runningTray) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+}
+if ($runningTray.Count -gt 0) { Start-Sleep -Seconds 1 }
+
 Copy-Item -LiteralPath $sourceScript -Destination $targetScript -Force
+Copy-Item -LiteralPath $sourceRepairScript -Destination $targetRepairScript -Force
 Unblock-File -LiteralPath $targetScript -ErrorAction SilentlyContinue
+Unblock-File -LiteralPath $targetRepairScript -ErrorAction SilentlyContinue
 
 $oldTask = Get-ScheduledTask -TaskName 'YaloKin4 Route Repair' -ErrorAction SilentlyContinue
 if ($null -ne $oldTask) {
@@ -47,5 +65,6 @@ Start-Process `
     -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$targetScript`""
 
 Write-Output "Installed tray application: $targetScript"
+Write-Output "Installed repair script: $targetRepairScript"
 Write-Output "Desktop shortcut: $shortcutPath"
 Write-Output "Log file: $(Join-Path $installDirectory 'hotspot.log')"

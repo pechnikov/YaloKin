@@ -12,6 +12,64 @@ $repairScript = Join-Path $PSScriptRoot 'Repair-YaloKinUgreen.ps1'
 $logDirectory = Join-Path $env:ProgramData 'YaloKinUgreen'
 $logPath = Join-Path $logDirectory 'hotspot.log'
 
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class YaloKinNativeIcon
+{
+    [DllImport("user32.dll")]
+    public static extern bool DestroyIcon(IntPtr handle);
+}
+'@
+
+function New-HotspotIcon {
+    param([Drawing.Color]$Color)
+
+    $bitmap = New-Object Drawing.Bitmap 32, 32
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $brush = New-Object Drawing.SolidBrush $Color
+    $whiteBrush = New-Object Drawing.SolidBrush ([Drawing.Color]::White)
+    $pen = New-Object Drawing.Pen $Color, 3.4
+    $body = New-Object Drawing.Drawing2D.GraphicsPath
+
+    try {
+        $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $pen.StartCap = [Drawing.Drawing2D.LineCap]::Round
+        $pen.EndCap = [Drawing.Drawing2D.LineCap]::Round
+
+        $graphics.DrawArc($pen, 6, 2, 20, 14, 205, 130)
+        $graphics.DrawArc($pen, 10, 7, 12, 8, 205, 130)
+        $graphics.DrawLine($pen, 16, 15, 16, 21)
+
+        $body.AddArc(4, 19, 6, 6, 180, 90)
+        $body.AddArc(22, 19, 6, 6, 270, 90)
+        $body.AddArc(22, 23, 6, 6, 0, 90)
+        $body.AddArc(4, 23, 6, 6, 90, 90)
+        $body.CloseFigure()
+        $graphics.FillPath($brush, $body)
+        $graphics.FillEllipse($whiteBrush, 20, 23, 3, 3)
+        $graphics.FillEllipse($whiteBrush, 24, 23, 3, 3)
+
+        $handle = $bitmap.GetHicon()
+        try {
+            return [Drawing.Icon]::FromHandle($handle).Clone()
+        }
+        finally {
+            [void][YaloKinNativeIcon]::DestroyIcon($handle)
+        }
+    }
+    finally {
+        $body.Dispose()
+        $pen.Dispose()
+        $whiteBrush.Dispose()
+        $brush.Dispose()
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
 function Get-StateLevel {
     param(
         [bool]$HotspotUp,
@@ -46,6 +104,16 @@ if ($SelfTest) {
         }
     }
 
+    $testIcon = New-HotspotIcon ([Drawing.ColorTranslator]::FromHtml('#2EAD5B'))
+    try {
+        if ($testIcon.Width -ne 32 -or $testIcon.Height -ne 32) {
+            throw 'Self-test failed: generated tray icon must be 32x32.'
+        }
+    }
+    finally {
+        $testIcon.Dispose()
+    }
+
     Write-Output 'Self-test OK.'
     exit 0
 }
@@ -66,7 +134,6 @@ if (-not $createdNew) {
 }
 
 Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 
 function Write-Log {
@@ -351,7 +418,12 @@ $exitItem.Text = 'Exit'
 [void]$script:menu.Items.Add($exitItem)
 
 $script:notify.ContextMenuStrip = $script:menu
-$script:notify.Icon = [Drawing.SystemIcons]::Application
+$script:stateIcons = @{
+    Stopped = New-HotspotIcon ([Drawing.ColorTranslator]::FromHtml('#E53935'))
+    Warning = New-HotspotIcon ([Drawing.ColorTranslator]::FromHtml('#F9A825'))
+    Ready   = New-HotspotIcon ([Drawing.ColorTranslator]::FromHtml('#2EAD5B'))
+}
+$script:notify.Icon = $script:stateIcons.Stopped
 $script:notify.Text = 'YaloKin Ugreen: starting'
 $script:notify.Visible = $true
 $script:lastLevel = $null
@@ -392,19 +464,19 @@ function Update-TrayStatus {
         $status = Get-HotspotStatus
         switch ($status.Level) {
             'Ready' {
-                $script:notify.Icon = [Drawing.SystemIcons]::Information
+                $script:notify.Icon = $script:stateIcons.Ready
                 $tip = 'YaloKin Ugreen: ready | Amnezia: connected'
             }
             'NoVpn' {
-                $script:notify.Icon = [Drawing.SystemIcons]::Warning
+                $script:notify.Icon = $script:stateIcons.Warning
                 $tip = 'YaloKin Ugreen: ready | Amnezia: unavailable'
             }
             'Degraded' {
-                $script:notify.Icon = [Drawing.SystemIcons]::Error
+                $script:notify.Icon = $script:stateIcons.Warning
                 $tip = 'YaloKin Ugreen: repair needed'
             }
             default {
-                $script:notify.Icon = [Drawing.SystemIcons]::Application
+                $script:notify.Icon = $script:stateIcons.Stopped
                 $tip = 'YaloKin Ugreen: stopped'
             }
         }
@@ -424,7 +496,7 @@ function Update-TrayStatus {
         }
     }
     catch {
-        $script:notify.Icon = [Drawing.SystemIcons]::Error
+        $script:notify.Icon = $script:stateIcons.Stopped
         $script:notify.Text = 'YaloKin Ugreen: status error'
         $script:statusItem.Text = 'Status: error'
         Write-Log "Status error: $($_.Exception.Message)"
@@ -512,6 +584,7 @@ finally {
     $script:timer.Dispose()
     $script:notify.Visible = $false
     $script:notify.Dispose()
+    foreach ($icon in $script:stateIcons.Values) { $icon.Dispose() }
     $script:menu.Dispose()
     $mutex.ReleaseMutex()
     $mutex.Dispose()

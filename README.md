@@ -11,6 +11,7 @@ Windows tray application for starting and monitoring a legacy Hosted Network hot
 - verifies the DHCP listeners on UDP ports `67` and `68` and repairs ICS when they disappear;
 - monitors DHCP, ICS, the hotspot adapter, the local routes, and the AmneziaVPN default route;
 - shows the current state in the Windows notification area;
+- uses one router-and-radio tray icon in red (stopped), amber (no VPN or repair needed), and green (ready);
 - discovers a recreated Hosted Network virtual adapter even if Windows changes its connection name or index.
 
 The repair logic lives in `Repair-YaloKinUgreen.ps1`. The tray application calls the same script at startup, for manual repair, and when monitoring detects a broken address, route, ICS binding, or DHCP listener. ICS changes run in a separate process with a timeout so a stuck Windows sharing API cannot freeze the tray.
@@ -62,6 +63,8 @@ Tray events are stored at `C:\ProgramData\YaloKinUgreen\hotspot.log`; full repai
 - `NoVpn`: hotspot is ready, but the AmneziaVPN route is unavailable.
 - `Degraded`: the hotspot is running but its address, ICS, DHCP, or routes need attention; automatic repair is attempted once per minute.
 - `Stopped`: Hosted Network is not running.
+
+The tray icon is green for `Ready`, amber for `NoVpn` and `Degraded`, and red for `Stopped` or a status error.
 
 ## Self-test
 

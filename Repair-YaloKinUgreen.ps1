@@ -11,6 +11,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $hotspotAddress = '192.168.137.1'
+$hotspotSubnet = '192.168.137.0/24'
+$smbRuleName = 'YaloKin SMB'
 $routePrefixes = @('192.168.137.0/25', '192.168.137.128/25')
 $netsh = "$env:SystemRoot\System32\netsh.exe"
 $logDirectory = Join-Path $env:ProgramData 'YaloKinUgreen'
@@ -50,6 +52,27 @@ function Test-IcsRoleSet {
     return ($publicReady -and $privateReady)
 }
 
+function Test-SmbRuleSet {
+    param($Rule, $PortFilter, $AddressFilter)
+
+    $validRemoteAddresses = @(
+        $hotspotSubnet,
+        '192.168.137.0/255.255.255.0'
+    )
+    return (
+        $null -ne $Rule -and
+        $Rule.Enabled.ToString() -eq 'True' -and
+        $Rule.Direction.ToString() -eq 'Inbound' -and
+        $Rule.Action.ToString() -eq 'Allow' -and
+        $PortFilter.Protocol.ToString() -eq 'TCP' -and
+        $PortFilter.LocalPort.ToString() -eq '445' -and
+        @($AddressFilter.LocalAddress) -contains $hotspotAddress -and
+        @($AddressFilter.RemoteAddress | Where-Object {
+            $_ -in $validRemoteAddresses
+        }).Count -gt 0
+    )
+}
+
 if ($SelfTest) {
     $good = @(
         [pscustomobject]@{ Name = 'AmneziaVPN'; Type = 'Public' },
@@ -61,6 +84,21 @@ if ($SelfTest) {
     }
     if (Test-IcsRoleSet $bad 'AmneziaVPN' 'Hosted') {
         throw 'Self-test failed for an invalid ICS role set.'
+    }
+    $goodRule = [pscustomobject]@{
+        Enabled = 'True'; Direction = 'Inbound'; Action = 'Allow'
+    }
+    $goodPort = [pscustomobject]@{ Protocol = 'TCP'; LocalPort = '445' }
+    $goodAddress = [pscustomobject]@{
+        LocalAddress = $hotspotAddress
+        RemoteAddress = '192.168.137.0/255.255.255.0'
+    }
+    if (-not (Test-SmbRuleSet $goodRule $goodPort $goodAddress)) {
+        throw 'Self-test failed for a valid SMB firewall rule.'
+    }
+    $goodPort.LocalPort = '139'
+    if (Test-SmbRuleSet $goodRule $goodPort $goodAddress) {
+        throw 'Self-test failed for an invalid SMB firewall rule.'
     }
     Write-Output 'Self-test OK.'
     exit 0
@@ -331,6 +369,46 @@ function Test-DhcpReady {
     return ($ports -contains 67 -and $ports -contains 68)
 }
 
+function Test-SmbAccessReady {
+    $service = Get-Service LanmanServer -ErrorAction SilentlyContinue
+    if ($null -eq $service -or $service.Status -ne 'Running') { return $false }
+
+    foreach ($rule in @(Get-NetFirewallRule `
+        -DisplayName $smbRuleName `
+        -ErrorAction SilentlyContinue)) {
+        $portFilter = $rule | Get-NetFirewallPortFilter
+        $addressFilter = $rule | Get-NetFirewallAddressFilter
+        if (Test-SmbRuleSet $rule $portFilter $addressFilter) { return $true }
+    }
+    return $false
+}
+
+function Ensure-SmbAccess {
+    Set-Service LanmanServer -StartupType Automatic
+    Start-Service LanmanServer
+
+    if (-not (Test-SmbAccessReady)) {
+        Get-NetFirewallRule `
+            -DisplayName $smbRuleName `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+        New-NetFirewallRule `
+            -DisplayName $smbRuleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 445 `
+            -LocalAddress $hotspotAddress `
+            -RemoteAddress $hotspotSubnet `
+            -Profile Any | Out-Null
+    }
+
+    if (-not (Test-SmbAccessReady)) {
+        throw 'Could not enable SMB access for the hotspot subnet.'
+    }
+    Write-RepairLog 'SMB access is enabled for the hotspot subnet.'
+}
+
 function Invoke-IcsRepairProcess {
     param(
         [string]$PowerShellPath,
@@ -402,6 +480,7 @@ try {
     Ensure-IcsBinding $adapter
     $adapter = Get-HotspotAdapter
     Set-HotspotNetworkConfiguration $adapter
+    Ensure-SmbAccess
     Write-RepairLog "Repair completed: adapter='$($adapter.Name)', ifIndex=$($adapter.InterfaceIndex)."
     exit 0
 }

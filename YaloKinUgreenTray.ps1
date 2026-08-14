@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 $privateName = 'YaloKin-Ugreen'
 $vpnName = 'AmneziaVPN'
 $hotspotAddress = '192.168.137.1'
+$hotspotSubnet = '192.168.137.0/24'
+$smbRuleName = 'YaloKin SMB'
 $routePrefixes = @('192.168.137.0/25', '192.168.137.128/25')
 $netsh = "$env:SystemRoot\System32\netsh.exe"
 $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -77,11 +79,13 @@ function Get-StateLevel {
         [bool]$DhcpReady,
         [bool]$RoutesReady,
         [bool]$IcsReady,
+        [bool]$SmbReady,
         [bool]$VpnReady
     )
 
     if (-not $HotspotUp) { return 'Stopped' }
-    if (-not ($AddressReady -and $DhcpReady -and $RoutesReady -and $IcsReady)) {
+    if (-not ($AddressReady -and $DhcpReady -and $RoutesReady -and $IcsReady -and
+        $SmbReady)) {
         return 'Degraded'
     }
     if (-not $VpnReady) { return 'NoVpn' }
@@ -90,17 +94,17 @@ function Get-StateLevel {
 
 if ($SelfTest) {
     $cases = @(
-        @($false, $false, $false, $false, $false, $false, 'Stopped'),
-        @($true,  $false, $false, $false, $false, $false, 'Degraded'),
-        @($true,  $true,  $true,  $true,  $true,  $false, 'NoVpn'),
-        @($true,  $true,  $true,  $true,  $true,  $true,  'Ready')
+        @($false, $false, $false, $false, $false, $false, $false, 'Stopped'),
+        @($true,  $false, $false, $false, $false, $false, $false, 'Degraded'),
+        @($true,  $true,  $true,  $true,  $true,  $true,  $false, 'NoVpn'),
+        @($true,  $true,  $true,  $true,  $true,  $true,  $true,  'Ready')
     )
 
     foreach ($case in $cases) {
         $actual = Get-StateLevel `
-            $case[0] $case[1] $case[2] $case[3] $case[4] $case[5]
-        if ($actual -ne $case[6]) {
-            throw "Self-test failed: expected $($case[6]), got $actual."
+            $case[0] $case[1] $case[2] $case[3] $case[4] $case[5] $case[6]
+        if ($actual -ne $case[7]) {
+            throw "Self-test failed: expected $($case[7]), got $actual."
         }
     }
 
@@ -232,6 +236,34 @@ function Test-IcsReady {
     }
 }
 
+function Test-SmbAccessReady {
+    $service = Get-Service LanmanServer -ErrorAction SilentlyContinue
+    if ($null -eq $service -or $service.Status -ne 'Running') { return $false }
+
+    $validRemoteAddresses = @(
+        $hotspotSubnet,
+        '192.168.137.0/255.255.255.0'
+    )
+    foreach ($rule in @(Get-NetFirewallRule `
+        -DisplayName $smbRuleName `
+        -ErrorAction SilentlyContinue)) {
+        $port = $rule | Get-NetFirewallPortFilter
+        $address = $rule | Get-NetFirewallAddressFilter
+        if (
+            $rule.Enabled.ToString() -eq 'True' -and
+            $rule.Direction.ToString() -eq 'Inbound' -and
+            $rule.Action.ToString() -eq 'Allow' -and
+            $port.Protocol.ToString() -eq 'TCP' -and
+            $port.LocalPort.ToString() -eq '445' -and
+            @($address.LocalAddress) -contains $hotspotAddress -and
+            @($address.RemoteAddress | Where-Object {
+                $_ -in $validRemoteAddresses
+            }).Count -gt 0
+        ) { return $true }
+    }
+    return $false
+}
+
 function Repair-HotspotRoutes {
     $adapter = Get-HotspotAdapter
     if ($null -eq $adapter -or $adapter.Status -ne 'Up') { return }
@@ -297,7 +329,7 @@ function Start-Hotspot {
     if ($process.ExitCode -ne 0) {
         throw "Hotspot repair failed with exit code $($process.ExitCode). See repair.log."
     }
-    Write-Log 'Full hotspot, ICS, DHCP, and route repair completed.'
+    Write-Log 'Full hotspot, ICS, DHCP, SMB, and route repair completed.'
 }
 
 function Stop-Hotspot {
@@ -323,6 +355,7 @@ function Get-HotspotStatus {
     $dhcpReady = $false
     $routesReady = $false
     $icsReady = $false
+    $smbReady = $false
 
     if ($hotspotUp) {
         $addressReady = $null -ne (Get-NetIPAddress `
@@ -354,17 +387,19 @@ function Get-HotspotStatus {
             if ($null -eq $route) { $routesReady = $false }
         }
         $icsReady = Test-IcsReady $adapter
+        $smbReady = Test-SmbAccessReady
     }
 
     $vpnReady = Test-VpnReady
     [pscustomobject]@{
         Level = Get-StateLevel `
-            $hotspotUp $addressReady $dhcpReady $routesReady $icsReady $vpnReady
+            $hotspotUp $addressReady $dhcpReady $routesReady $icsReady $smbReady $vpnReady
         HotspotUp = $hotspotUp
         AddressReady = $addressReady
         DhcpReady = $dhcpReady
         RoutesReady = $routesReady
         IcsReady = $icsReady
+        SmbReady = $smbReady
         VpnReady = $vpnReady
     }
 }
@@ -377,6 +412,7 @@ function Get-StatusText {
         "Address ${hotspotAddress}: $($Status.AddressReady)",
         "DHCP: $($Status.DhcpReady)",
         "ICS binding: $($Status.IcsReady)",
+        "SMB access: $($Status.SmbReady)",
         "Local /25 routes: $($Status.RoutesReady)",
         "AmneziaVPN route: $($Status.VpnReady)",
         "State: $($Status.Level)"
@@ -557,7 +593,8 @@ $script:timer.Add_Tick({
             $status.AddressReady -and
             $status.DhcpReady -and
             $status.RoutesReady -and
-            $status.IcsReady
+            $status.IcsReady -and
+            $status.SmbReady
         )
         if ($networkDegraded -and
             ((Get-Date) - $script:lastRepairAttempt).TotalSeconds -ge 60) {

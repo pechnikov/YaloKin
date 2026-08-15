@@ -1,5 +1,9 @@
 [CmdletBinding()]
-param([switch]$SelfTest)
+param(
+    [switch]$StatusWorker,
+    [string]$StatusPath,
+    [switch]$SelfTest
+)
 
 $ErrorActionPreference = 'Stop'
 $privateName = 'YaloKin-Ugreen'
@@ -124,21 +128,12 @@ if ($SelfTest) {
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+if (-not $StatusWorker -and
+    -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments
     exit 0
 }
-
-$createdNew = $false
-$mutex = New-Object Threading.Mutex($true, 'Local\YaloKinUgreenTray', [ref]$createdNew)
-if (-not $createdNew) {
-    $mutex.Dispose()
-    exit 0
-}
-
-Add-Type -AssemblyName System.Windows.Forms
-[Windows.Forms.Application]::EnableVisualStyles()
 
 function Write-Log {
     param([string]$Message)
@@ -264,74 +259,6 @@ function Test-SmbAccessReady {
     return $false
 }
 
-function Repair-HotspotRoutes {
-    $adapter = Get-HotspotAdapter
-    if ($null -eq $adapter -or $adapter.Status -ne 'Up') { return }
-
-    $address = Get-NetIPAddress `
-        -InterfaceIndex $adapter.InterfaceIndex `
-        -AddressFamily IPv4 `
-        -IPAddress $hotspotAddress `
-        -ErrorAction SilentlyContinue
-    if ($null -eq $address) { return }
-
-    $ipInterface = Get-NetIPInterface `
-        -InterfaceIndex $adapter.InterfaceIndex `
-        -AddressFamily IPv4 `
-        -ErrorAction SilentlyContinue
-    if ($null -ne $ipInterface -and $ipInterface.InterfaceMetric -ne 1) {
-        Set-NetIPInterface `
-            -InterfaceIndex $adapter.InterfaceIndex `
-            -AddressFamily IPv4 `
-            -InterfaceMetric 1
-        Write-Log "Set interface metric 1 on $($adapter.Name)."
-    }
-
-    foreach ($prefix in $routePrefixes) {
-        $routes = @(Get-NetRoute `
-            -PolicyStore ActiveStore `
-            -DestinationPrefix $prefix `
-            -InterfaceIndex $adapter.InterfaceIndex `
-            -ErrorAction SilentlyContinue |
-            Where-Object NextHop -eq '0.0.0.0')
-
-        if ($routes.Count -eq 0) {
-            New-NetRoute `
-                -DestinationPrefix $prefix `
-                -InterfaceIndex $adapter.InterfaceIndex `
-                -NextHop '0.0.0.0' `
-                -RouteMetric 1 `
-                -ErrorAction Stop | Out-Null
-            Write-Log "Added route $prefix via $($adapter.Name)."
-            continue
-        }
-
-        foreach ($route in $routes) {
-            if ($route.RouteMetric -ne 1) {
-                $route | Set-NetRoute -RouteMetric 1 -Confirm:$false
-                Write-Log "Set route metric 1 for $prefix."
-            }
-        }
-    }
-}
-
-function Start-Hotspot {
-    if (-not (Test-Path -LiteralPath $repairScript)) {
-        throw "Repair script not found: $repairScript"
-    }
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$repairScript`" -Quiet"
-    $process = Start-Process `
-        -FilePath $powerShell `
-        -ArgumentList $arguments `
-        -WindowStyle Hidden `
-        -Wait `
-        -PassThru
-    if ($process.ExitCode -ne 0) {
-        throw "Hotspot repair failed with exit code $($process.ExitCode). See repair.log."
-    }
-    Write-Log 'Full hotspot, ICS, DHCP, SMB, and route repair completed.'
-}
-
 function Stop-Hotspot {
     $stop = Invoke-Netsh -Arguments @('wlan', 'stop', 'hostednetwork')
     $adapter = Get-HotspotAdapter
@@ -339,13 +266,6 @@ function Stop-Hotspot {
         throw "Windows could not stop Hosted Network (exit $($stop.ExitCode))."
     }
     Write-Log 'Hotspot stopped.'
-}
-
-function Restart-Hotspot {
-    [void](Invoke-Netsh -Arguments @('wlan', 'stop', 'hostednetwork'))
-    Start-Sleep -Seconds 3
-    Start-Hotspot
-    Write-Log 'Hotspot restarted.'
 }
 
 function Get-HotspotStatus {
@@ -419,6 +339,34 @@ function Get-StatusText {
     ) -join [Environment]::NewLine
 }
 
+if ($StatusWorker) {
+    if ([string]::IsNullOrWhiteSpace($StatusPath)) {
+        throw 'Status worker requires -StatusPath.'
+    }
+    try {
+        $json = Get-HotspotStatus | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText(
+            $StatusPath,
+            $json,
+            [Text.UTF8Encoding]::new($false)
+        )
+        exit 0
+    }
+    catch {
+        exit 1
+    }
+}
+
+$createdNew = $false
+$mutex = New-Object Threading.Mutex($true, 'Local\YaloKinUgreenTray', [ref]$createdNew)
+if (-not $createdNew) {
+    $mutex.Dispose()
+    exit 0
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+[Windows.Forms.Application]::EnableVisualStyles()
+
 $script:notify = New-Object Windows.Forms.NotifyIcon
 $script:menu = New-Object Windows.Forms.ContextMenuStrip
 $script:statusItem = New-Object Windows.Forms.ToolStripMenuItem
@@ -463,79 +411,201 @@ $script:notify.Icon = $script:stateIcons.Stopped
 $script:notify.Text = 'YaloKin Ugreen: starting'
 $script:notify.Visible = $true
 $script:lastLevel = $null
+$script:lastStatus = $null
 $script:backgroundRepair = $null
+$script:backgroundRepairStarted = [datetime]::MinValue
+$script:backgroundRepairName = $null
 $script:lastRepairAttempt = [datetime]::MinValue
+$script:backgroundStatus = $null
+$script:backgroundStatusStarted = [datetime]::MinValue
+$script:lastStatusCheck = [datetime]::MinValue
+$statusResultPath = Join-Path $logDirectory 'status.pending.json'
+$statusIntervalSeconds = 60
+$statusTimeoutSeconds = 20
+$repairTimeoutSeconds = 120
+
+function Set-TrayStatusError {
+    param([string]$Message)
+
+    $script:notify.Icon = $script:stateIcons.Warning
+    $script:notify.Text = 'YaloKin Ugreen: status unavailable'
+    $script:statusItem.Text = "Status: $Message"
+}
+
+function Set-TrayStatus {
+    param([Parameter(Mandatory)]$Status)
+
+    switch ($Status.Level) {
+        'Ready' {
+            $script:notify.Icon = $script:stateIcons.Ready
+            $tip = 'YaloKin Ugreen: ready | Amnezia: connected'
+        }
+        'NoVpn' {
+            $script:notify.Icon = $script:stateIcons.Warning
+            $tip = 'YaloKin Ugreen: ready | Amnezia: unavailable'
+        }
+        'Degraded' {
+            $script:notify.Icon = $script:stateIcons.Warning
+            $tip = 'YaloKin Ugreen: repair needed'
+        }
+        default {
+            $script:notify.Icon = $script:stateIcons.Stopped
+            $tip = 'YaloKin Ugreen: stopped'
+        }
+    }
+
+    $script:notify.Text = $tip.Substring(0, [Math]::Min(63, $tip.Length))
+    $script:statusItem.Text = "Status: $($Status.Level)"
+
+    if ($script:lastLevel -ne $Status.Level) {
+        $icon = if ($Status.Level -eq 'Ready') {
+            [Windows.Forms.ToolTipIcon]::Info
+        } else {
+            [Windows.Forms.ToolTipIcon]::Warning
+        }
+        $script:notify.ShowBalloonTip(4000, 'YaloKin Ugreen', $tip, $icon)
+        Write-Log "State changed to $($Status.Level)."
+        $script:lastLevel = $Status.Level
+    }
+}
+
+function Stop-BackgroundStatusCheck {
+    if ($null -eq $script:backgroundStatus) { return }
+    if (-not $script:backgroundStatus.HasExited) {
+        Stop-Process -Id $script:backgroundStatus.Id -Force -ErrorAction SilentlyContinue
+    }
+    $script:backgroundStatus.Dispose()
+    $script:backgroundStatus = $null
+    Remove-Item -LiteralPath $statusResultPath -Force -ErrorAction SilentlyContinue
+}
 
 function Update-BackgroundRepair {
-    if ($null -eq $script:backgroundRepair -or
-        -not $script:backgroundRepair.HasExited) {
+    if ($null -eq $script:backgroundRepair) { return }
+    if (-not $script:backgroundRepair.HasExited) {
+        if (((Get-Date) - $script:backgroundRepairStarted).TotalSeconds -le
+            $repairTimeoutSeconds) { return }
+
+        Stop-Process -Id $script:backgroundRepair.Id -Force -ErrorAction SilentlyContinue
+        Write-Log "$($script:backgroundRepairName) timed out after $repairTimeoutSeconds seconds."
+        $script:notify.ShowBalloonTip(
+            5000,
+            'YaloKin Ugreen error',
+            'Hotspot repair timed out. See repair.log.',
+            [Windows.Forms.ToolTipIcon]::Error
+        )
+        $script:backgroundRepair.Dispose()
+        $script:backgroundRepair = $null
+        $script:lastStatusCheck = [datetime]::MinValue
         return
     }
 
-    Write-Log "Automatic repair exited with code $($script:backgroundRepair.ExitCode)."
+    $exitCode = $script:backgroundRepair.ExitCode
+    $name = $script:backgroundRepairName
     $script:backgroundRepair.Dispose()
     $script:backgroundRepair = $null
+    if ($exitCode -eq 0) {
+        Write-Log "$name succeeded."
+    } else {
+        Write-Log "$name failed with exit code $exitCode."
+        $script:notify.ShowBalloonTip(
+            5000,
+            'YaloKin Ugreen error',
+            "Hotspot repair failed with exit code $exitCode. See repair.log.",
+            [Windows.Forms.ToolTipIcon]::Error
+        )
+    }
+    $script:lastStatusCheck = [datetime]::MinValue
 }
 
 function Start-BackgroundRepair {
+    param(
+        [string]$Name = 'Automatic repair',
+        [switch]$Restart
+    )
+
     Update-BackgroundRepair
-    if ($null -ne $script:backgroundRepair) { return }
+    if ($null -ne $script:backgroundRepair) {
+        Write-Log "$Name skipped because a repair is already running."
+        return
+    }
     if (-not (Test-Path -LiteralPath $repairScript)) {
-        Write-Log "Automatic repair script not found: $repairScript"
+        Write-Log "Repair script not found: $repairScript"
         return
     }
 
+    Stop-BackgroundStatusCheck
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$repairScript`" -Quiet"
+    if ($Restart) { $arguments += ' -Restart' }
     $script:backgroundRepair = Start-Process `
         -FilePath $powerShell `
         -ArgumentList $arguments `
         -WindowStyle Hidden `
         -PassThru
-    $script:lastRepairAttempt = Get-Date
-    Write-Log 'Automatic full repair started in the background.'
+    $script:backgroundRepairStarted = Get-Date
+    $script:backgroundRepairName = $Name
+    $script:lastRepairAttempt = $script:backgroundRepairStarted
+    $script:notify.Icon = $script:stateIcons.Warning
+    $script:notify.Text = 'YaloKin Ugreen: repairing'
+    $script:statusItem.Text = 'Status: repairing'
+    Write-Log "$Name started in the background."
 }
 
-function Update-TrayStatus {
+function Start-BackgroundStatusCheck {
+    if ($null -ne $script:backgroundRepair -or
+        $null -ne $script:backgroundStatus -or
+        ((Get-Date) - $script:lastStatusCheck).TotalSeconds -lt
+            $statusIntervalSeconds) { return }
+
+    Remove-Item -LiteralPath $statusResultPath -Force -ErrorAction SilentlyContinue
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -StatusWorker -StatusPath `"$statusResultPath`""
+    $script:backgroundStatus = Start-Process `
+        -FilePath $powerShell `
+        -ArgumentList $arguments `
+        -WindowStyle Hidden `
+        -PassThru
+    $script:backgroundStatusStarted = Get-Date
+    $script:lastStatusCheck = $script:backgroundStatusStarted
+}
+
+function Update-BackgroundStatus {
+    if ($null -eq $script:backgroundStatus) { return }
+    if (-not $script:backgroundStatus.HasExited) {
+        if (((Get-Date) - $script:backgroundStatusStarted).TotalSeconds -le
+            $statusTimeoutSeconds) { return }
+
+        Stop-BackgroundStatusCheck
+        $script:lastStatusCheck = Get-Date
+        Set-TrayStatusError 'timeout'
+        Write-Log "Status check timed out after $statusTimeoutSeconds seconds."
+        return
+    }
+
+    $exitCode = $script:backgroundStatus.ExitCode
+    $script:backgroundStatus.Dispose()
+    $script:backgroundStatus = $null
+    $script:lastStatusCheck = Get-Date
     try {
-        $status = Get-HotspotStatus
-        switch ($status.Level) {
-            'Ready' {
-                $script:notify.Icon = $script:stateIcons.Ready
-                $tip = 'YaloKin Ugreen: ready | Amnezia: connected'
-            }
-            'NoVpn' {
-                $script:notify.Icon = $script:stateIcons.Warning
-                $tip = 'YaloKin Ugreen: ready | Amnezia: unavailable'
-            }
-            'Degraded' {
-                $script:notify.Icon = $script:stateIcons.Warning
-                $tip = 'YaloKin Ugreen: repair needed'
-            }
-            default {
-                $script:notify.Icon = $script:stateIcons.Stopped
-                $tip = 'YaloKin Ugreen: stopped'
-            }
+        if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $statusResultPath)) {
+            throw "Status worker exited with code $exitCode."
         }
+        $status = Get-Content -Raw -LiteralPath $statusResultPath | ConvertFrom-Json
+        if ([string]::IsNullOrWhiteSpace($status.Level)) {
+            throw 'Status worker returned an invalid result.'
+        }
+        $script:lastStatus = $status
+        Set-TrayStatus $status
 
-        $script:notify.Text = $tip.Substring(0, [Math]::Min(63, $tip.Length))
-        $script:statusItem.Text = "Status: $($status.Level)"
-
-        if ($script:lastLevel -ne $status.Level) {
-            $icon = if ($status.Level -eq 'Ready') {
-                [Windows.Forms.ToolTipIcon]::Info
-            } else {
-                [Windows.Forms.ToolTipIcon]::Warning
-            }
-            $script:notify.ShowBalloonTip(4000, 'YaloKin Ugreen', $tip, $icon)
-            Write-Log "State changed to $($status.Level)."
-            $script:lastLevel = $status.Level
+        if ($status.Level -eq 'Degraded' -and
+            ((Get-Date) - $script:lastRepairAttempt).TotalSeconds -ge 60) {
+            Start-BackgroundRepair
         }
     }
     catch {
-        $script:notify.Icon = $script:stateIcons.Stopped
-        $script:notify.Text = 'YaloKin Ugreen: status error'
-        $script:statusItem.Text = 'Status: error'
+        Set-TrayStatusError 'error'
         Write-Log "Status error: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item -LiteralPath $statusResultPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -555,25 +625,34 @@ function Invoke-TrayAction {
             [Windows.Forms.ToolTipIcon]::Error
         )
     }
-    Update-TrayStatus
+    $script:lastStatusCheck = [datetime]::MinValue
+    Start-BackgroundStatusCheck
 }
 
-$startItem.Add_Click({ Invoke-TrayAction 'Start/repair' { Start-Hotspot } })
-$restartItem.Add_Click({ Invoke-TrayAction 'Restart' { Restart-Hotspot } })
+$startItem.Add_Click({ Start-BackgroundRepair -Name 'Manual repair' })
+$restartItem.Add_Click({ Start-BackgroundRepair -Name 'Manual restart' -Restart })
 $stopItem.Add_Click({ Invoke-TrayAction 'Stop' { Stop-Hotspot } })
 $detailsItem.Add_Click({
-    $status = Get-HotspotStatus
+    $text = if ($null -eq $script:lastStatus) {
+        'Status check is still in progress.'
+    } else {
+        Get-StatusText $script:lastStatus
+    }
     [void][Windows.Forms.MessageBox]::Show(
-        (Get-StatusText $status),
+        $text,
         'YaloKin Ugreen status',
         [Windows.Forms.MessageBoxButtons]::OK,
         [Windows.Forms.MessageBoxIcon]::Information
     )
 })
 $script:notify.Add_DoubleClick({
-    $status = Get-HotspotStatus
+    $text = if ($null -eq $script:lastStatus) {
+        'Status check is still in progress.'
+    } else {
+        Get-StatusText $script:lastStatus
+    }
     [void][Windows.Forms.MessageBox]::Show(
-        (Get-StatusText $status),
+        $text,
         'YaloKin Ugreen status'
     )
 })
@@ -584,33 +663,21 @@ $logItem.Add_Click({
 $exitItem.Add_Click({ [Windows.Forms.Application]::ExitThread() })
 
 $script:timer = New-Object Windows.Forms.Timer
-$script:timer.Interval = 10000
+$script:timer.Interval = 1000
 $script:timer.Add_Tick({
     try {
         Update-BackgroundRepair
-        $status = Get-HotspotStatus
-        $networkDegraded = $status.HotspotUp -and -not (
-            $status.AddressReady -and
-            $status.DhcpReady -and
-            $status.RoutesReady -and
-            $status.IcsReady -and
-            $status.SmbReady
-        )
-        if ($networkDegraded -and
-            ((Get-Date) - $script:lastRepairAttempt).TotalSeconds -ge 60) {
-            Start-BackgroundRepair
-        } elseif ($status.HotspotUp -and $status.AddressReady) {
-            Repair-HotspotRoutes
-        }
+        Update-BackgroundStatus
+        Start-BackgroundStatusCheck
     }
     catch {
-        Write-Log "Periodic route repair failed: $($_.Exception.Message)"
+        Set-TrayStatusError 'error'
+        Write-Log "Background monitor failed: $($_.Exception.Message)"
     }
-    Update-TrayStatus
 })
 
 Write-Log 'Tray application started.'
-Invoke-TrayAction 'Automatic start' { Start-Hotspot }
+Start-BackgroundRepair -Name 'Automatic start'
 $script:timer.Start()
 
 try {
@@ -619,6 +686,10 @@ try {
 finally {
     $script:timer.Stop()
     $script:timer.Dispose()
+    Stop-BackgroundStatusCheck
+    if ($null -ne $script:backgroundRepair) {
+        $script:backgroundRepair.Dispose()
+    }
     $script:notify.Visible = $false
     $script:notify.Dispose()
     foreach ($icon in $script:stateIcons.Values) { $icon.Dispose() }

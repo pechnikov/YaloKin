@@ -10,12 +10,12 @@ Windows tray application for starting and monitoring a legacy Hosted Network hot
 - checks and automatically rebinds Internet Connection Sharing from `AmneziaVPN` to the current Hosted Network adapter;
 - verifies the DHCP listeners on UDP ports `67` and `68` and repairs ICS when they disappear;
 - starts the Windows SMB server and maintains an inbound TCP `445` firewall rule limited to local address `192.168.137.1` and clients in `192.168.137.0/24`;
-- monitors DHCP, ICS, SMB access, the hotspot adapter, the local routes, and the AmneziaVPN default route;
+- monitors DHCP, ICS, SMB access, the hotspot adapter, the local routes, and the AmneziaVPN default route in a background process with a timeout;
 - shows the current state in the Windows notification area;
 - uses one router-and-radio tray icon in red (stopped), amber (no VPN or repair needed), and green (ready);
 - discovers a recreated Hosted Network virtual adapter even if Windows changes its connection name or index.
 
-The repair logic lives in `Repair-YaloKinUgreen.ps1`. The tray application calls the same script at startup, for manual repair, and when monitoring detects a broken address, route, ICS binding, DHCP listener, or SMB firewall rule. ICS changes run in a separate process with a timeout so a stuck Windows sharing API cannot freeze the tray.
+The repair logic lives in `Repair-YaloKinUgreen.ps1`. The tray application starts the same script asynchronously at startup, for manual repair, and when monitoring detects a broken address, route, ICS binding, DHCP listener, or SMB firewall rule. Status collection and ICS changes run in separate processes with timeouts, so a stuck Windows sharing API cannot freeze the tray menu.
 
 ## Requirements
 

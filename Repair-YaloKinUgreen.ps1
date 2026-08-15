@@ -5,6 +5,7 @@ param(
     [string]$PrivateName,
     [switch]$IcsWorker,
     [switch]$ForcePrivate,
+    [switch]$Restart,
     [switch]$Quiet,
     [switch]$SelfTest
 )
@@ -114,6 +115,7 @@ if (-not $isAdministrator) {
     if ($IcsWorker) { throw 'ICS worker requires administrator rights.' }
 
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -PublicName `"$PublicName`" -Ssid `"$Ssid`""
+    if ($Restart) { $arguments += ' -Restart' }
     if ($Quiet) { $arguments += ' -Quiet' }
     $process = Start-Process powershell.exe `
         -Verb RunAs `
@@ -475,6 +477,11 @@ function Ensure-IcsBinding {
 
 try {
     Write-RepairLog 'Repair started.'
+    if ($Restart) {
+        Write-RepairLog 'Restart requested; stopping Hosted Network first.'
+        [void](Invoke-Netsh @('wlan', 'stop', 'hostednetwork'))
+        Start-Sleep -Seconds 3
+    }
     $adapter = Start-OrRepairHostedNetwork
     Set-HotspotNetworkConfiguration $adapter
     Ensure-IcsBinding $adapter
